@@ -1,0 +1,28 @@
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  temperature: 0.7
+  max_tokens: 2000
+
+embedding:
+  model: "text-embedding-3-small"
+  dimension: 1536
+  batch_size: 32
+
+retrieval:
+  top_k: 5
+  score_threshold: 0.7
+  hybrid_search:
+    enabled: true
+    vector_weight: 0.7
+    keyword_weight: 0.3
+
+chunking:
+  chunk_size: 600
+  chunk_overlap: 100
+  strategy: "semantic"  # semantic, fixed, recursive
+
+nlp:
+  stopwords_enabled: true
+  keyword_extraction: true
+  max_keywords: 5
