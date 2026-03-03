@@ -1,0 +1,22 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-dotenv==1.0.1
+pydantic==2.9.2
+httpx==0.27.2
+requests==2.32.3
+
+langchain==0.3.7
+langchain-community==0.3.5
+langgraph==0.2.45
+faiss-cpu==1.8.0.post1
+rank-bm25==0.2.2
+
+openai==1.54.3
+langfuse==2.52.0
+numpy>=1.26.0
+
+# 根据需要接入混元 API，可在代码中通过 httpx/requests 调用，不强制绑定 SDK
+# 后续 BGE Reranker 支持（Phase 3 之后）：
+# sentence-transformers>=2.7.0
+# FlagEmbedding>=1.2.0
+
