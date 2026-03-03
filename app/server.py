@@ -139,7 +139,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
     session_id = req.session_id or str(uuid.uuid4())
     chat_app = get_chat_app()
 
-    async def event_generator():
+    async def event_generator():  # type: ignore[return]
         config = {"configurable": {"thread_id": session_id}}
         state_input = {"messages": [HumanMessage(content=req.message)]}
         full_answer = ""
@@ -175,5 +175,45 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+class DiagnoseRequest(BaseModel):
+    alert_input: str
+    session_id: Optional[str] = None
+
+
+@app.post("/ops/diagnose")
+async def ops_diagnose(req: DiagnoseRequest) -> JSONResponse:
+    """
+    运维诊断接口（非流式）。
+
+    对应 Go：internal/controller/chat/chat_v1_ai_ops.go
+    流程：Router Agent → [Log / Metrics / RAG] → Diagnosis Agent → Report
+    """
+    from app.agents.ops_workflow import get_ops_app
+    from app.agents.state import OpsState
+
+    ops_app = get_ops_app()
+    init_state: OpsState = {
+        "alert_input": req.alert_input,
+        "alerts": [],
+        "log_summary": "",
+        "metrics_summary": "",
+        "rag_context": [],
+        "diagnosis_report": "",
+        "next_action": "",
+        "human_approved": None,
+        "iteration": 0,
+    }
+    try:
+        result = await ops_app.ainvoke(init_state)
+        return JSONResponse({
+            "session_id": req.session_id or "",
+            "diagnosis_report": result.get("diagnosis_report", ""),
+            "log_summary": result.get("log_summary", ""),
+            "metrics_summary": result.get("metrics_summary", ""),
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
