@@ -58,7 +58,7 @@ async def test_ops():
     print("=" * 50)
     print("Test 4: Ops Agent (Multi-Agent State Machine)")
     print("=" * 50)
-    app = build_ops_graph()
+    app = build_ops_graph(use_hitl=False)
     init_state: OpsState = {
         "alert_input": "order-service Pod 频繁重启，CPU 使用率超过 80%，请分析根因",
         "alerts": [],
@@ -67,6 +67,7 @@ async def test_ops():
         "rag_context": [],
         "diagnosis_report": "",
         "next_action": "",
+        "risk_level": "",
         "human_approved": None,
         "iteration": 0,
     }
@@ -75,6 +76,8 @@ async def test_ops():
     print(result.get("log_summary", "")[:400])
     print("\n--- Metrics Summary ---")
     print(result.get("metrics_summary", "")[:400])
+    print("\n--- Risk Level ---")
+    print(result.get("risk_level", "unknown"))
     print("\n--- Diagnosis Report ---")
     print(result.get("diagnosis_report", "")[:1000])
     print()

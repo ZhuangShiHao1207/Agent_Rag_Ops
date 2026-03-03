@@ -1,33 +1,37 @@
 """
-运维 Agent —— LangGraph 多 Agent 状态机
+运维 Agent —— LangGraph 多 Agent 状态机（含 HITL）
 
 对应 Go 项目：internal/ai/agent/plan_execute_replan/
 
-架构（状态机流转）：
+完整流转：
     START
       │
-    router_agent          ← 解析告警，决定路由（对应 Go Planner 第 1 步）
-      │ 条件边
+    router_agent          ← 解析告警、决定分析方向
+      │
     ┌─┴──────────────┬────────────────┐
     │                │                │
-  log_analyst     metrics_agent    rag_recall    ← 并行分析（对应 Go Executor 三类工具）
+  log_analyst   metrics_agent    rag_recall    ← 三路并行
     │                │                │
     └────────────────┴────────────────┘
-              汇聚（Diagnosis Agent 前置等待）
                       │
-              diagnosis_agent      ← 根因分析 RCA（对应 Go Planner 推理阶段）
+              diagnosis_agent      ← RCA 根因分析
                       │ 条件边
-            ┌─────────┴──────────┐
-            │                    │
-        report_node          replan_node   ← 信息不足则 Replan（对应 Go Replanner）
-            │
-           END
+             ┌────────┴────────┐
+             │                 │
+         replan_node      action_router   ← 风险分级路由
+                               │ 条件边
+                    ┌──────────┴──────────┐
+                    │                     │
+            human_approval          report_node   ← 低风险直接结束
+            (HITL 审批节点)              │
+                    │                    END
+                   END      ← 高风险等待人工，resume 后继续
 
-特性：
-- 三路分析节点共享同一 OpsState，通过字段隔离输出（无竞争条件）
-- Diagnosis Agent 用强力 hunyuan-pro 模型（可配置为 deepseek-r1）
-- Replan 最多 2 轮防止死循环
-- Phase 5 在 report_node 前插入 HITL 审批节点
+HITL 实现：
+  - compile(interrupt_before=["human_approval"]) 让图在进入该节点前暂停
+  - 前端通过 SSE 收到 interrupt 事件后弹确认框
+  - 用户回传决策 → POST /ops/approve {thread_id, approved}
+  - 服务端更新 state.human_approved 后 resume（再次 ainvoke 同 thread_id）
 """
 from __future__ import annotations
 
@@ -35,39 +39,35 @@ import json
 from typing import Any, Dict, List, Literal
 
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.errors import NodeInterrupt
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.state import Alert, OpsState
 from app.agents.tools.log_tool import query_pod_logs
 from app.agents.tools.prometheus import query_metrics, query_prometheus_alerts
-from app.agents.tools.rag_tool import query_internal_docs
 from app.llm import build_llm_client
 
-MAX_ITERATIONS = 2  # Replan 最大迭代次数
+MAX_ITERATIONS = 2
+
+# 高危操作关键词（触发 HITL）
+HIGH_RISK_KEYWORDS = [
+    "重启", "restart", "回滚", "rollback", "删除", "delete",
+    "清空", "truncate", "扩容", "scale", "DDL", "drop",
+]
 
 
 # --------------------------------------------------------------------------
 # 内部帮助函数
 # --------------------------------------------------------------------------
 
-def _llm_call(system: str, user: str, model_override: str | None = None) -> str:
-    """同步调用 LLM，支持指定不同模型（如 hunyuan-pro 用于深度推理）。"""
+def _llm_call(system: str, user: str) -> str:
+    """同步调用 LLM。"""
     client = build_llm_client()
-    # 临时替换模型（运维诊断用更强的模型）
-    if model_override:
-        orig_model = client.settings.llm_model
-        client.settings.__dict__["llm_model"] = model_override
-
-    result = client.chat([
+    return client.chat([
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ])
-
-    if model_override:
-        client.settings.__dict__["llm_model"] = orig_model
-
-    return result
 
 
 # --------------------------------------------------------------------------
@@ -118,6 +118,7 @@ def router_agent_node(state: OpsState) -> Dict[str, Any]:
             "need_rag": parsed.get("need_rag", True),
             "services": parsed.get("services", ["api-server"]),
         }),
+        "risk_level": "",
         "iteration": state.get("iteration", 0),
     }
 
@@ -246,7 +247,7 @@ def diagnosis_agent_node(state: OpsState) -> Dict[str, Any]:
     if ("信息不足" in report or "无法确定" in report) and iteration < MAX_ITERATIONS:
         next_action = "replan"
     else:
-        next_action = "report"
+        next_action = "action_router"
 
     return {
         "diagnosis_report": report,
@@ -256,18 +257,71 @@ def diagnosis_agent_node(state: OpsState) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# 节点 4a：Report Node —— 输出最终报告
+# 节点 4：Action Router —— 风险分级
+# --------------------------------------------------------------------------
+
+def action_router_node(state: OpsState) -> Dict[str, Any]:
+    """
+    判断诊断报告中的建议是否包含高危操作。
+    高危 → human_approval（HITL 暂停）
+    低危 → report_node（直接输出）
+    """
+    report = state.get("diagnosis_report", "")
+    is_high_risk = any(kw in report for kw in HIGH_RISK_KEYWORDS)
+    risk_level = "high" if is_high_risk else "low"
+    return {
+        "risk_level": risk_level,
+        "next_action": "human_approval" if is_high_risk else "report",
+    }
+
+
+# --------------------------------------------------------------------------
+# 节点 5：Human Approval（HITL）
+# --------------------------------------------------------------------------
+
+def human_approval_node(state: OpsState) -> Dict[str, Any]:
+    """
+    HITL 审批节点。
+
+    当 compile(interrupt_before=["human_approval"]) 时，LangGraph 在进入
+    本节点前暂停（Checkpoint 保存当前 State），前端通过 SSE 收到 interrupt 事件。
+    用户通过 POST /ops/approve 提交决策后，调用方 resume（同 thread_id 再次调用）。
+
+    本节点执行时 human_approved 已由调用方通过 update_state 注入。
+    """
+    approved = state.get("human_approved")
+    if approved is None:
+        raise NodeInterrupt("等待人工审批，请通过 /ops/approve 接口提交决策。")
+
+    if not approved:
+        return {
+            "diagnosis_report": (
+                state.get("diagnosis_report", "") +
+                "\n\n---\n⚠️ **[人工审批]** 高危操作已被拒绝，系统保持当前状态，建议人工介入处理。"
+            ),
+            "next_action": "report",
+        }
+
+    return {
+        "diagnosis_report": (
+            state.get("diagnosis_report", "") +
+            "\n\n---\n✅ **[人工审批]** 高危操作已获批准，建议按照上述步骤执行。请做好回滚预案。"
+        ),
+        "next_action": "report",
+    }
+
+
+# --------------------------------------------------------------------------
+# 节点 6a：Report Node —— 输出最终报告
 # --------------------------------------------------------------------------
 
 def report_node(state: OpsState) -> Dict[str, Any]:
-    """直接返回诊断报告（无需额外处理，Phase 5 在此前插入 HITL）。"""
-    # LangGraph 要求节点必须返回至少一个 state 字段；
-    # next_action 置为 "report" 标识最终状态，其余字段保持不变。
+    """终止节点，标记 next_action = report。"""
     return {"next_action": "report"}
 
 
 # --------------------------------------------------------------------------
-# 节点 4b：Replan Node —— 补充信息后重新路由
+# 节点 6b：Replan Node —— 补充信息后重新路由
 # --------------------------------------------------------------------------
 
 def replan_node(state: OpsState) -> Dict[str, Any]:
@@ -304,22 +358,29 @@ def replan_node(state: OpsState) -> Dict[str, Any]:
 # 条件边路由函数
 # --------------------------------------------------------------------------
 
-def route_after_diagnosis(state: OpsState) -> Literal["report_node", "replan_node"]:
-    """Diagnosis Agent 后的路由：report 或 replan。"""
+def route_after_diagnosis(state: OpsState) -> Literal["action_router", "replan_node"]:
+    """Diagnosis Agent 后的路由：action_router 或 replan。"""
     if state.get("next_action") == "replan" and state.get("iteration", 0) <= MAX_ITERATIONS:
         return "replan_node"
-    return "report_node"
+    return "action_router"
+
+
+def route_after_action_router(state: OpsState) -> Literal["human_approval", "report_node"]:
+    """Action Router 后的路由：高危 → human_approval，低危 → report_node。"""
+    return "human_approval" if state.get("risk_level") == "high" else "report_node"
 
 
 # --------------------------------------------------------------------------
 # 图构建
 # --------------------------------------------------------------------------
 
-def build_ops_graph():
+def build_ops_graph(use_hitl: bool = True):
     """
-    构建运维 Agent 的 LangGraph StateGraph。
+    构建运维 Agent StateGraph。
 
-    三路分析节点（log/metrics/rag）并发执行后汇聚到 diagnosis_agent。
+    Args:
+        use_hitl: True  → 启用 HITL（interrupt_before=["human_approval"]），需 MemorySaver。
+                  False → 不中断，适合脚本测试。
     """
     g = StateGraph(OpsState)
 
@@ -329,6 +390,8 @@ def build_ops_graph():
     g.add_node("metrics_agent", metrics_agent_node)
     g.add_node("rag_recall", rag_recall_node)
     g.add_node("diagnosis_agent", diagnosis_agent_node)
+    g.add_node("action_router", action_router_node)
+    g.add_node("human_approval", human_approval_node)
     g.add_node("report_node", report_node)
     g.add_node("replan_node", replan_node)
 
@@ -345,27 +408,39 @@ def build_ops_graph():
     g.add_edge("metrics_agent", "diagnosis_agent")
     g.add_edge("rag_recall", "diagnosis_agent")
 
-    # diagnosis 条件边
+    # diagnosis → action_router | replan
     g.add_conditional_edges(
         "diagnosis_agent",
         route_after_diagnosis,
-        {"report_node": "report_node", "replan_node": "replan_node"},
+        {"action_router": "action_router", "replan_node": "replan_node"},
     )
 
     # replan → 重新进入三路分析
     g.add_edge("replan_node", "log_analyst")
+
+    # action_router → human_approval | report_node
+    g.add_conditional_edges(
+        "action_router",
+        route_after_action_router,
+        {"human_approval": "human_approval", "report_node": "report_node"},
+    )
+
+    # human_approval → report_node
+    g.add_edge("human_approval", "report_node")
     g.add_edge("report_node", END)
 
-    return g.compile()
+    checkpointer = MemorySaver() if use_hitl else None
+    interrupt_before = ["human_approval"] if use_hitl else []
+    return g.compile(checkpointer=checkpointer, interrupt_before=interrupt_before)
 
 
-# 模块级单例
+# 模块级单例（use_hitl=True，生产模式）
 _ops_app = None
 
 
-def get_ops_app():
+def get_ops_app(use_hitl: bool = True):
     """获取编译好的运维 Agent 图（单例）。"""
     global _ops_app
     if _ops_app is None:
-        _ops_app = build_ops_graph()
+        _ops_app = build_ops_graph(use_hitl=use_hitl)
     return _ops_app

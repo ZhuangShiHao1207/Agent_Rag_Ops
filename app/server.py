@@ -8,6 +8,8 @@ FastAPI 服务入口
   POST /knowledge/index      构建/重建 FAISS + BM25 索引
   POST /chat/stream          对话（SSE 流式推送，接入 LangGraph 对话 Agent）
   POST /chat                 对话（非流式，便于调试）
+  POST /ops/diagnose         运维诊断（LangGraph 多 Agent RCA，含 HITL）
+  POST /ops/approve          HITL 人工审批（resume 暂停的 ops graph）
 """
 import json
 import uuid
@@ -112,11 +114,12 @@ async def chat(req: ChatRequest) -> ChatResponse:
     完整等待 LangGraph 跑完后返回最终答案。
     """
     from app.agents.chat_workflow import get_chat_app
+    from app.observability.langfuse_callback import build_config
 
     session_id = req.session_id or str(uuid.uuid4())
     chat_app = get_chat_app()
 
-    config = {"configurable": {"thread_id": session_id}}
+    config = build_config(thread_id=session_id, session_id=session_id)
     state_input = {"messages": [HumanMessage(content=req.message)]}
 
     result = await chat_app.ainvoke(state_input, config=config)
@@ -135,12 +138,13 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
       data: {"type": "error",  "message": "..."}
     """
     from app.agents.chat_workflow import get_chat_app
+    from app.observability.langfuse_callback import build_config
 
     session_id = req.session_id or str(uuid.uuid4())
     chat_app = get_chat_app()
 
     async def event_generator():  # type: ignore[return]
-        config = {"configurable": {"thread_id": session_id}}
+        config = build_config(thread_id=session_id, session_id=session_id)
         state_input = {"messages": [HumanMessage(content=req.message)]}
         full_answer = ""
 
@@ -182,18 +186,31 @@ class DiagnoseRequest(BaseModel):
     session_id: Optional[str] = None
 
 
+class ApproveRequest(BaseModel):
+    thread_id: str
+    approved: bool
+
+
 @app.post("/ops/diagnose")
 async def ops_diagnose(req: DiagnoseRequest) -> JSONResponse:
     """
-    运维诊断接口（非流式）。
+    运维诊断接口（非流式，含 HITL 支持）。
 
     对应 Go：internal/controller/chat/chat_v1_ai_ops.go
-    流程：Router Agent → [Log / Metrics / RAG] → Diagnosis Agent → Report
+    流程：Router Agent → [Log / Metrics / RAG] → Diagnosis Agent → Action Router
+          → (high risk) human_approval(HITL 暂停) → report
+          → (low  risk) report
+
+    HITL 响应：{"status": "interrupted", "thread_id": "...", "risk_level": "high", ...}
+    正常响应：{"status": "done", "thread_id": "...", "diagnosis_report": "...", ...}
     """
     from app.agents.ops_workflow import get_ops_app
     from app.agents.state import OpsState
+    from app.observability.langfuse_callback import build_config
 
-    ops_app = get_ops_app()
+    thread_id = req.session_id or str(uuid.uuid4())
+    ops_app = get_ops_app(use_hitl=True)
+
     init_state: OpsState = {
         "alert_input": req.alert_input,
         "alerts": [],
@@ -202,16 +219,78 @@ async def ops_diagnose(req: DiagnoseRequest) -> JSONResponse:
         "rag_context": [],
         "diagnosis_report": "",
         "next_action": "",
+        "risk_level": "",
         "human_approved": None,
         "iteration": 0,
     }
+    config = build_config(thread_id=thread_id, session_id=thread_id)
     try:
-        result = await ops_app.ainvoke(init_state)
+        result = await ops_app.ainvoke(init_state, config=config)
+
+        # 检查图是否因 HITL 而暂停（interrupt_before=["human_approval"]）
+        graph_state = ops_app.get_state(config)
+        if graph_state.next and "human_approval" in graph_state.next:
+            return JSONResponse({
+                "status": "interrupted",
+                "thread_id": thread_id,
+                "risk_level": result.get("risk_level", "high"),
+                "diagnosis_report": result.get("diagnosis_report", ""),
+                "message": "诊断发现高危操作，请人工审批后继续。通过 POST /ops/approve 提交决策。",
+            })
+
         return JSONResponse({
-            "session_id": req.session_id or "",
+            "status": "done",
+            "thread_id": thread_id,
             "diagnosis_report": result.get("diagnosis_report", ""),
             "log_summary": result.get("log_summary", ""),
             "metrics_summary": result.get("metrics_summary", ""),
+            "risk_level": result.get("risk_level", "low"),
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/ops/approve")
+async def ops_approve(req: ApproveRequest) -> JSONResponse:
+    """
+    HITL 人工审批接口。
+
+    前端在收到 /ops/diagnose 返回 status=interrupted 后，弹出确认对话框，
+    用户决策后调用本接口 resume LangGraph 图的执行。
+
+    Body: {"thread_id": "...", "approved": true/false}
+    """
+    from app.agents.ops_workflow import get_ops_app
+    from app.observability.langfuse_callback import build_config
+
+    ops_app = get_ops_app(use_hitl=True)
+    config = build_config(thread_id=req.thread_id, session_id=req.thread_id)
+
+    # 验证图状态
+    try:
+        graph_state = ops_app.get_state(config)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"未找到会话 {req.thread_id}: {e}")
+
+    if not graph_state.next or "human_approval" not in graph_state.next:
+        raise HTTPException(status_code=400, detail="该会话未处于等待审批状态。")
+
+    # 注入审批结果到 Checkpoint State
+    ops_app.update_state(
+        config,
+        {"human_approved": req.approved},
+        as_node="action_router",   # 以 action_router 身份更新（确保 LangGraph 接受）
+    )
+
+    # Resume 执行（传 None 表示从 Checkpoint 继续）
+    try:
+        result = await ops_app.ainvoke(None, config=config)
+        return JSONResponse({
+            "status": "done",
+            "thread_id": req.thread_id,
+            "approved": req.approved,
+            "diagnosis_report": result.get("diagnosis_report", ""),
+            "risk_level": result.get("risk_level", ""),
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

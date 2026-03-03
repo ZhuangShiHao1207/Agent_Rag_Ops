@@ -61,6 +61,7 @@ class OpsState(TypedDict):
     metrics_summary: str
     rag_context: List[Document]
     diagnosis_report: str
-    next_action: str
+    next_action: str          # report / auto_fix / human_approval / replan
+    risk_level: str           # low / high —— 由 action_router 判断，决定是否触发 HITL
     human_approved: Optional[bool]
     iteration: int
