@@ -1,12 +1,12 @@
 llm:
-  provider: "openai"
-  model: "gpt-4o-mini"
+  provider: "hunyuan"
+  model: "hunyuan-turbo"
   temperature: 0.7
   max_tokens: 2000
 
 embedding:
-  model: "text-embedding-3-small"
-  dimension: 1536
+  model: "hunyuan-embedding"
+  dimension: 1024
   batch_size: 32
 
 retrieval:

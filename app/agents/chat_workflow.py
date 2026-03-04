@@ -28,7 +28,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.agents.state import ChatState
 from app.agents.tools import get_current_time, query_internal_docs
-from app.llm import build_llm_client
+from app.llm import build_langchain_llm
 from app.rag.hybrid_retriever import HybridRetriever
 
 # --------------------------------------------------------------------------
@@ -71,28 +71,6 @@ def rag_retrieve_node(state: ChatState) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# 工具模式描述（传给 LLM 的 function schema）
-# --------------------------------------------------------------------------
-
-def _build_tools_schema() -> List[Dict[str, Any]]:
-    """将 LangChain tool 转换为 OpenAI function-calling schema。"""
-    schemas = []
-    for t in TOOLS:
-        schemas.append({
-            "type": "function",
-            "function": {
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.args_schema.model_json_schema() if t.args_schema else {"type": "object", "properties": {}},
-            },
-        })
-    return schemas
-
-
-_TOOLS_SCHEMA = _build_tools_schema()
-
-
-# --------------------------------------------------------------------------
 # 节点：ReAct Agent（支持工具调用循环）
 # --------------------------------------------------------------------------
 
@@ -100,13 +78,17 @@ def react_agent_node(state: ChatState) -> Dict[str, Any]:
     """
     ReAct Agent 节点：
     1. 将 RAG 文档拼接到 system prompt
-    2. 调用 LLM（带工具 schema）
+    2. 通过 LangChain ChatOpenAI（bind_tools）调用 LLM
+       — 使用 LangChain ChatModel 而非裸 SDK，确保 LangGraph astream_events
+         能捕获 on_chat_model_stream 事件，SSE 流式输出才能正常工作。
     3. 若 LLM 请求工具调用，执行工具并追加结果，循环直到 AI 纯文本回复
     4. 返回最终 answer 与完整 messages 追加
 
     对应 Go：chat_pipeline/tools_node.go + lambda_func.go
     """
-    client = build_llm_client()
+    # 使用 LangChain ChatModel（会触发 on_chat_model_stream 事件）
+    llm = build_langchain_llm()
+    llm_with_tools = llm.bind_tools(TOOLS)
 
     # 1. 构建 system prompt（RAG 文档注入）
     rag_docs: List[Document] = state.get("rag_docs", [])
@@ -122,96 +104,43 @@ def react_agent_node(state: ChatState) -> Dict[str, Any]:
     if rag_context:
         system_content += f"\n\n【运维知识库参考文档】\n{rag_context}"
 
-    # 2. 构建消息列表（system + 对话历史）
-    messages_for_llm = [{"role": "system", "content": system_content}]
-    for msg in state["messages"]:
-        if isinstance(msg, HumanMessage):
-            messages_for_llm.append({"role": "user", "content": msg.content})
-        elif isinstance(msg, AIMessage):
-            entry: Dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
-            if msg.tool_calls:
-                entry["tool_calls"] = [
-                    {
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {"name": tc["name"], "arguments": str(tc["args"])},
-                    }
-                    for tc in msg.tool_calls
-                ]
-            messages_for_llm.append(entry)
-        elif isinstance(msg, ToolMessage):
-            messages_for_llm.append({
-                "role": "tool",
-                "tool_call_id": msg.tool_call_id,
-                "content": msg.content,
-            })
+    # 2. 构建 LangChain 消息列表（system + 对话历史）
+    lc_messages: List[Any] = [SystemMessage(content=system_content)] + list(state["messages"])
 
     # 3. ReAct 循环（最多 5 轮工具调用防止死循环）
     new_messages: List[Any] = []
+    final_answer = ""
+
     for _ in range(5):
-        response = client.chat(messages_for_llm, tools=_TOOLS_SCHEMA)  # type: ignore[arg-type]
+        # invoke 经过 LangChain 事件系统 → astream_events 可捕获 on_chat_model_stream
+        response: AIMessage = llm_with_tools.invoke(lc_messages)
+        lc_messages.append(response)
+        new_messages.append(response)
 
-        # 判断是否有工具调用（response 是 str，需要检查原始 API response）
-        # 重新用原始 client 调用以获取结构化信息
-        raw_resp = client._client.chat.completions.create(
-            model=client.settings.llm_model,
-            messages=messages_for_llm,  # type: ignore[arg-type]
-            tools=_TOOLS_SCHEMA,  # type: ignore[arg-type]
-        )
-        choice = raw_resp.choices[0]
-        ai_msg_content = choice.message.content or ""
-        tool_calls = choice.message.tool_calls or []
-
-        if not tool_calls:
+        if not response.tool_calls:
             # 纯文本回复，结束循环
-            new_messages.append(AIMessage(content=ai_msg_content))
-            return {
-                "messages": new_messages,
-                "answer": ai_msg_content,
-            }
+            final_answer = response.content if isinstance(response.content, str) else ""
+            break
 
-        # 有工具调用：记录 AI 消息，执行工具，继续循环
-        ai_langchain_msg = AIMessage(
-            content=ai_msg_content,
-            tool_calls=[
-                {"id": tc.id, "name": tc.function.name, "args": eval(tc.function.arguments)}  # noqa: S307
-                for tc in tool_calls
-            ],
-        )
-        new_messages.append(ai_langchain_msg)
-
-        # 执行工具并追加 ToolMessage
-        tool_entry: Dict[str, Any] = {
-            "role": "assistant",
-            "content": ai_msg_content,
-            "tool_calls": [
-                {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
-                for tc in tool_calls
-            ],
-        }
-        messages_for_llm.append(tool_entry)
-
-        for tc in tool_calls:
-            tool_fn = TOOL_MAP.get(tc.function.name)
+        # 执行工具调用，结果追加为 ToolMessage
+        for tc in response.tool_calls:
+            tool_fn = TOOL_MAP.get(tc["name"])
             if tool_fn:
-                import json
                 try:
-                    args = json.loads(tc.function.arguments)
-                except Exception:
-                    args = {}
-                tool_result = str(tool_fn.invoke(args))
+                    tool_result = str(tool_fn.invoke(tc["args"]))
+                except Exception as e:
+                    tool_result = f"工具执行错误: {e}"
             else:
-                tool_result = f"Tool {tc.function.name} not found."
+                tool_result = f"工具 {tc['name']} 不存在。"
 
-            new_messages.append(ToolMessage(content=tool_result, tool_call_id=tc.id))
-            messages_for_llm.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": tool_result,
-            })
+            tm = ToolMessage(content=tool_result, tool_call_id=tc["id"])
+            lc_messages.append(tm)
+            new_messages.append(tm)
 
-    # 超过最大轮次，返回最后一次 AI 回复
-    return {"messages": new_messages, "answer": ai_msg_content}  # type: ignore[possibly-undefined]
+    return {
+        "messages": new_messages,
+        "answer": final_answer,
+    }
 
 
 # --------------------------------------------------------------------------

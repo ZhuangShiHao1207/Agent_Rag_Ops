@@ -76,3 +76,30 @@ class LLMClient(Embeddings):
 def build_llm_client() -> LLMClient:
     return LLMClient()
 
+
+def build_langchain_llm(**kwargs):
+    """
+    返回与 LangGraph 事件系统兼容的 LangChain ChatOpenAI 实例。
+    使用此函数替代 build_llm_client() 可正确触发 on_chat_model_stream 事件，
+    从而使 SSE 流式输出正常工作。
+    """
+    from langchain_openai import ChatOpenAI
+
+    settings = get_settings()
+    if settings.llm_provider == "openai":
+        return ChatOpenAI(
+            model=settings.llm_model,
+            api_key=settings.openai_api_key,
+            base_url=settings.openai_api_base or "https://api.openai.com/v1",
+            **kwargs,
+        )
+    elif settings.llm_provider == "hunyuan":
+        return ChatOpenAI(
+            model=settings.llm_model,
+            api_key=settings.hunyuan_api_key,
+            base_url=settings.hunyuan_api_base,
+            **kwargs,
+        )
+    else:
+        raise ValueError(f"Unsupported LLM_PROVIDER: {settings.llm_provider}")
+
