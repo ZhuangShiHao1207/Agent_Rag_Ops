@@ -98,6 +98,18 @@ class HexaOpsApp {
         this.hitlReportPreview = document.getElementById('hitlReportPreview');
         this.hitlApprove       = document.getElementById('hitlApprove');
         this.hitlReject        = document.getElementById('hitlReject');
+        // 上传文档 Modal
+        this.uploadDocsItem    = document.getElementById('uploadDocsItem');
+        this.docFileInput      = document.getElementById('docFileInput');
+        this.uploadModal       = document.getElementById('uploadModal');
+        this.uploadModalClose  = document.getElementById('uploadModalClose');
+        this.uploadModalCancel = document.getElementById('uploadModalCancel');
+        this.uploadConfirmBtn  = document.getElementById('uploadConfirmBtn');
+        this.uploadFileList    = document.getElementById('uploadFileList');
+        this.uploadProgress    = document.getElementById('uploadProgress');
+        this.uploadProgressFill= document.getElementById('uploadProgressFill');
+        this.uploadProgressText= document.getElementById('uploadProgressText');
+        this.uploadResult      = document.getElementById('uploadResult');
     }
 
     // -------------------------------------------------------------------------
@@ -114,6 +126,8 @@ class HexaOpsApp {
         // 工具菜单
         this.toolsBtn?.addEventListener('click', e => { e.stopPropagation(); this.toggleToolsMenu(); });
         this.rebuildIndexItem?.addEventListener('click', () => { this.closeToolsMenu(); this.rebuildIndex(); });
+        this.uploadDocsItem?.addEventListener('click', () => { this.closeToolsMenu(); this.docFileInput?.click(); });
+        this.docFileInput?.addEventListener('change', e => { this.onFilesSelected(e.target.files); });
         document.addEventListener('click', e => {
             if (this.toolsBtn && this.toolsMenu &&
                 !this.toolsBtn.contains(e.target) && !this.toolsMenu.contains(e.target)) {
@@ -150,6 +164,14 @@ class HexaOpsApp {
         // HITL 审批 Modal
         this.hitlApprove?.addEventListener('click', () => this.submitApproval(true));
         this.hitlReject?.addEventListener('click', () => this.submitApproval(false));
+
+        // 上传文档 Modal
+        this.uploadModalClose?.addEventListener('click', () => this.closeUploadModal());
+        this.uploadModalCancel?.addEventListener('click', () => this.closeUploadModal());
+        this.uploadModal?.addEventListener('click', e => {
+            if (e.target === this.uploadModal) this.closeUploadModal();
+        });
+        this.uploadConfirmBtn?.addEventListener('click', () => this.submitUpload());
     }
 
     // -------------------------------------------------------------------------
@@ -412,6 +434,87 @@ class HexaOpsApp {
         } finally {
             this.isStreaming = false;
             this.updateUI();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 上传知识库文档
+    // -------------------------------------------------------------------------
+    onFilesSelected(fileList) {
+        if (!fileList || fileList.length === 0) return;
+        this.selectedFiles = Array.from(fileList);
+        if (this.uploadFileList) {
+            this.uploadFileList.innerHTML = this.selectedFiles.map(f => `
+                <div class="upload-file-item">
+                    <span class="upload-file-name">${f.name}</span>
+                    <span class="upload-file-size">${(f.size / 1024).toFixed(1)} KB</span>
+                </div>`).join('');
+        }
+        if (this.uploadProgress) this.uploadProgress.style.display = 'none';
+        if (this.uploadResult) this.uploadResult.style.display = 'none';
+        if (this.uploadConfirmBtn) {
+            this.uploadConfirmBtn.disabled = false;
+            this.uploadConfirmBtn.textContent = '上传并重建索引';
+        }
+        if (this.uploadModal) this.uploadModal.style.display = 'flex';
+        if (this.docFileInput) this.docFileInput.value = '';
+    }
+
+    closeUploadModal() {
+        if (this.uploadModal) this.uploadModal.style.display = 'none';
+        this.selectedFiles = [];
+    }
+
+    async submitUpload() {
+        if (!this.selectedFiles || this.selectedFiles.length === 0) return;
+        if (this.uploadConfirmBtn) this.uploadConfirmBtn.disabled = true;
+        if (this.uploadProgress) {
+            this.uploadProgress.style.display = 'block';
+            this.uploadProgressFill.style.width = '20%';
+            this.uploadProgressText.textContent = '正在上传文件...';
+        }
+        try {
+            // Step 1: upload files
+            const formData = new FormData();
+            this.selectedFiles.forEach(f => formData.append('files', f));
+            const uploadResp = await fetch(`${this.apiBaseUrl}/knowledge/upload`, {
+                method: 'POST',
+                body: formData,
+            });
+            if (!uploadResp.ok) {
+                const err = await uploadResp.json();
+                throw new Error(err.detail?.message || `HTTP ${uploadResp.status}`);
+            }
+            const uploadData = await uploadResp.json();
+            if (this.uploadProgressFill) this.uploadProgressFill.style.width = '50%';
+            if (this.uploadProgressText) this.uploadProgressText.textContent = '文件上传成功，正在重建索引...';
+
+            // Step 2: rebuild index automatically
+            const indexResp = await fetch(`${this.apiBaseUrl}/knowledge/index`, { method: 'POST' });
+            if (!indexResp.ok) throw new Error(`索引重建失败 HTTP ${indexResp.status}`);
+            const indexData = await indexResp.json();
+            if (this.uploadProgressFill) this.uploadProgressFill.style.width = '100%';
+            if (this.uploadProgressText) this.uploadProgressText.textContent = '完成！';
+
+            if (this.uploadResult) {
+                this.uploadResult.style.display = 'block';
+                this.uploadResult.innerHTML = `
+                    <div class="upload-result-success">
+                        ✅ 上传成功：${uploadData.saved?.join('、') || ''}<br>
+                        📚 索引已重建：共 ${indexData.chunk_count || 0} 个文档块
+                        ${uploadData.skipped?.length ? `<br>⚠️ 跳过：${uploadData.skipped.join('、')}` : ''}
+                    </div>`;
+            }
+            if (this.uploadConfirmBtn) this.uploadConfirmBtn.textContent = '完成';
+            this.showNotification(`知识库更新成功！共 ${indexData.chunk_count || 0} 个文档块`, 'success');
+        } catch (error) {
+            if (this.uploadProgressText) this.uploadProgressText.textContent = `失败：${error.message}`;
+            if (this.uploadResult) {
+                this.uploadResult.style.display = 'block';
+                this.uploadResult.innerHTML = `<div class="upload-result-error">❌ ${error.message}</div>`;
+            }
+            if (this.uploadConfirmBtn) this.uploadConfirmBtn.disabled = false;
+            this.showNotification('上传失败：' + error.message, 'error');
         }
     }
 

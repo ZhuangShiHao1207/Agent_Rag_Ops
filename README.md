@@ -511,6 +511,18 @@ Markdown 加载（langchain TextLoader）
 
 ## RAG 评估
 
+分片和召回的实际内容可以通过下列指令查看
+```bash
+# 查看前 20 个文档块（默认）
+curl http://localhost:8001/knowledge/inspect
+
+# 查看更多
+curl "http://localhost:8001/knowledge/inspect?limit=50"
+
+# 输入一个查询，看向量相似度会召回哪些内容
+curl "http://localhost:8001/knowledge/search?q=Pod+OOMKilled&k=3"
+```
+
 评估 Notebook 位于 `notebooks/rag_evaluation.ipynb`，提供三路对比：
 
 ```bash

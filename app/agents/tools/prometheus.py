@@ -26,10 +26,22 @@ _MOCK_ALERTS = [
         "description": "CPU 使用率持续 5 分钟超过 80%，当前值：87.3%",
     },
     {
-        "name": "PodCrashLooping",
+        "name": "HighMemoryUsage",
+        "severity": "warning",
+        "labels": {"instance": "10.0.0.2:9100", "job": "node-exporter"},
+        "description": "内存使用率持续 10 分钟超过 85%，当前值：91.4%",
+    },
+    {
+        "name": "ServiceDown",
         "severity": "critical",
-        "labels": {"namespace": "production", "pod": "order-service-7d9f8b-xk2p9"},
-        "description": "Pod order-service-7d9f8b-xk2p9 在过去 10 分钟内重启 5 次",
+        "labels": {"service": "payment-service", "namespace": "production"},
+        "description": "payment-service 无法通过健康检查接口访问",
+    },
+    {
+        "name": "HighErrorRate",
+        "severity": "critical",
+        "labels": {"service": "gateway", "status": "5xx"},
+        "description": "HTTP 5xx 错误率 5 分钟内超过 12%",
     },
 ]
 

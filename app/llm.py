@@ -16,6 +16,7 @@ class LLMClient(Embeddings):
     支持：
     - OpenAI（直接使用官方 SDK）
     - Hunyuan（混元）：OpenAI 兼容接口，切换 api_key + base_url 即可
+    - Qwen（阿里云百炼 / DashScope）：OpenAI 兼容接口
     """
 
     def __init__(self) -> None:
@@ -36,6 +37,16 @@ class LLMClient(Embeddings):
             self._client = OpenAI(
                 api_key=self.settings.hunyuan_api_key,
                 base_url=self.settings.hunyuan_api_base,
+            )
+        elif self.provider == "qwen":
+            if not self.settings.qwen_api_key:
+                raise ValueError(
+                    "QWEN_API_KEY is not set. "
+                    "Please add it to your .env file: QWEN_API_KEY=sk-xxx"
+                )
+            self._client = OpenAI(
+                api_key=self.settings.qwen_api_key,
+                base_url=self.settings.qwen_api_base,
             )
         else:
             raise ValueError(f"Unsupported LLM_PROVIDER: {self.provider}")
@@ -82,6 +93,8 @@ def build_langchain_llm(**kwargs):
     返回与 LangGraph 事件系统兼容的 LangChain ChatOpenAI 实例。
     使用此函数替代 build_llm_client() 可正确触发 on_chat_model_stream 事件，
     从而使 SSE 流式输出正常工作。
+
+    支持 openai / hunyuan / qwen 三个 provider。
     """
     from langchain_openai import ChatOpenAI
 
@@ -98,6 +111,13 @@ def build_langchain_llm(**kwargs):
             model=settings.llm_model,
             api_key=settings.hunyuan_api_key,
             base_url=settings.hunyuan_api_base,
+            **kwargs,
+        )
+    elif settings.llm_provider == "qwen":
+        return ChatOpenAI(
+            model=settings.llm_model,
+            api_key=settings.qwen_api_key,
+            base_url=settings.qwen_api_base,
             **kwargs,
         )
     else:

@@ -6,17 +6,22 @@ FastAPI 服务入口
 路由：
   GET  /health               健康检查
   POST /knowledge/index      构建/重建 FAISS + BM25 索引
+  POST /knowledge/upload     上传知识库文档（.md/.txt）
+  GET  /knowledge/inspect    查看向量库内容（调试）
+  GET  /knowledge/search     测试 RAG 检索效果（调试）
   POST /chat/stream          对话（SSE 流式推送，接入 LangGraph 对话 Agent）
   POST /chat                 对话（非流式，便于调试）
   POST /ops/diagnose         运维诊断（LangGraph 多 Agent RCA，含 HITL）
   POST /ops/approve          HITL 人工审批（resume 暂停的 ops graph）
 """
 import json
+import shutil
 import uuid
 from contextlib import asynccontextmanager
-from typing import AsyncIterator, Optional
+from pathlib import Path
+from typing import AsyncIterator, List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from langchain_core.messages import HumanMessage
@@ -24,6 +29,7 @@ from pydantic import BaseModel
 
 from app.config import Settings, get_settings
 from app.rag.indexer import rebuild_index
+from app.rag.vector_store import build_vector_store
 
 
 # --------------------------------------------------------------------------
@@ -100,11 +106,108 @@ async def knowledge_index(
     构建/重建知识库索引（FAISS 向量索引 + BM25 倒排索引）。
     从 data/ 目录加载所有 Markdown 文档并切分写入。
     """
+    # 清除 Settings 缓存，确保重建时读取最新的 .env 配置
+    get_settings.cache_clear()
     try:
         stats = rebuild_index()
         return JSONResponse({"message": "ok", **stats})
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+_ALLOWED_SUFFIXES = {".md", ".txt", ".pdf"}
+_MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+
+
+@app.post("/knowledge/upload")
+async def knowledge_upload(
+    files: List[UploadFile] = File(...),
+) -> JSONResponse:
+    """
+    上传知识库文档到 data/ 目录。
+    支持文件类型：.md / .txt（PDF 需额外安装解析库）。
+    上传后需再次调用 /knowledge/index 来重建索引。
+    """
+    settings = get_settings()
+    # data_root 与 indexer.py 中保持一致：项目根下的 data/
+    data_root = settings.faiss_index_path.parent.parent  # indexes/ -> data/
+
+    saved: List[str] = []
+    skipped: List[str] = []
+
+    for upload in files:
+        filename = upload.filename or "unnamed"
+        suffix = Path(filename).suffix.lower()
+
+        if suffix not in _ALLOWED_SUFFIXES:
+            skipped.append(f"{filename} (不支持的文件类型，仅支持 .md / .txt)")
+            continue
+
+        # 读取文件内容，核查大小
+        content = await upload.read()
+        if len(content) > _MAX_FILE_SIZE:
+            skipped.append(f"{filename} (文件过大，限 20MB)")
+            continue
+
+        dest = data_root / filename
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(content)
+        saved.append(filename)
+
+    if not saved and skipped:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "所有文件均被跳过", "skipped": skipped},
+        )
+
+    return JSONResponse({
+        "message": f"上传完成，共 {len(saved)} 个文件。请调用 /knowledge/index 重建索引。",
+        "saved": saved,
+        "skipped": skipped,
+        "data_dir": str(data_root),
+    })
+
+
+@app.get("/knowledge/inspect")
+async def knowledge_inspect(limit: int = 20) -> JSONResponse:
+    """
+    检查向量数据库内容（调试用）。
+    返回索引中存储的文档块总数及前 limit 条内容。
+    """
+    vs = build_vector_store()
+    vs._ensure_loaded()
+    if vs._faiss is None:
+        return JSONResponse({"total": 0, "chunks": [], "message": "索引尚未建立，请先调用 /knowledge/index"})
+
+    docstore: dict = vs._faiss.docstore._dict
+    total = len(docstore)
+    chunks = [
+        {
+            "id": k,
+            "content": v.page_content[:400],
+            "metadata": v.metadata,
+        }
+        for k, v in list(docstore.items())[:limit]
+    ]
+    return JSONResponse({"total": total, "limit": limit, "chunks": chunks})
+
+
+@app.get("/knowledge/search")
+async def knowledge_search(q: str, k: int = 5) -> JSONResponse:
+    """
+    测试 RAG 检索效果（调试用）。
+    对给定查询 q 做向量相似度检索，返回 top-k 文档块。
+    """
+    vs = build_vector_store()
+    docs = vs.similarity_search(q, k=k)
+    return JSONResponse({
+        "query": q,
+        "k": k,
+        "results": [
+            {"rank": i + 1, "content": d.page_content, "metadata": d.metadata}
+            for i, d in enumerate(docs)
+        ],
+    })
 
 
 @app.post("/chat")

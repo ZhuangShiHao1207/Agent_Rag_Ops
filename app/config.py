@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     )
 
     # LLM provider & models
-    llm_provider: Literal["openai", "hunyuan"] = Field(
+    llm_provider: Literal["openai", "hunyuan", "qwen"] = Field(
         default="hunyuan", env="LLM_PROVIDER"
     )
     llm_model: str = Field(default="hunyuan-turbo", env="LLM_MODEL")
@@ -36,6 +36,12 @@ class Settings(BaseSettings):
     # Hunyuan endpoint（混元 OpenAI 兼容接口）
     hunyuan_api_base: str = Field(
         default="https://api.hunyuan.cloud.tencent.com/v1", env="HUNYUAN_API_BASE"
+    )
+
+    # Qwen / 阿里云百炼（DashScope OpenAI 兼容接口）
+    qwen_api_key: str | None = Field(default=None, env="QWEN_API_KEY")
+    qwen_api_base: str = Field(
+        default="https://dashscope.aliyuncs.com/compatible-mode/v1", env="QWEN_API_BASE"
     )
 
     # Vector index (FAISS for current phase)
