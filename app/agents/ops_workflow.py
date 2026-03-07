@@ -134,6 +134,10 @@ def log_analyst_node(state: OpsState) -> Dict[str, Any]:
     """
     try:
         routing = json.loads(state.get("next_action", "{}"))
+        # 增加判断，如果不需要日志分析，直接返回空摘要
+        if not routing.get("need_logs", True):
+            return {"log_summary": "根据判断，跳过日志分析。"}
+
         services: List[str] = routing.get("services", ["api-server"])
     except Exception:
         services = ["api-server"]
@@ -166,6 +170,10 @@ def metrics_agent_node(state: OpsState) -> Dict[str, Any]:
     """
     try:
         routing = json.loads(state.get("next_action", "{}"))
+        # 增加判断，如果不需要指标分析，直接返回空摘要
+        if not routing.get("need_metrics", True):
+            return {"metrics_summary": "根据判断，跳过指标分析。"}
+        
         services: List[str] = routing.get("services", ["api-server"])
     except Exception:
         services = ["api-server"]
@@ -195,6 +203,14 @@ def rag_recall_node(state: OpsState) -> Dict[str, Any]:
     对应 Go：Executor 调用 query_internal_docs.go 工具。
     从知识库检索与当前告警相关的运维手册文档。
     """
+    # 增加判断，如果不需要 RAG 分析，直接返回空结果
+    try:
+        routing = json.loads(state.get("next_action", "{}"))
+        if not routing.get("need_rag", True):
+            return {"rag_context": []}
+    except Exception:
+        pass
+
     alerts = state.get("alerts", [])
     query = state.get("alert_input", "")
     if alerts:
@@ -417,6 +433,8 @@ def build_ops_graph(use_hitl: bool = True):
 
     # replan → 重新进入三路分析
     g.add_edge("replan_node", "log_analyst")
+    g.add_edge("replan_node", "metrics_agent")
+    g.add_edge("replan_node", "rag_recall")
 
     # action_router → human_approval | report_node
     g.add_conditional_edges(
