@@ -132,7 +132,7 @@ class HybridRetriever:
     @classmethod
     def from_saved_indexes(
         cls,
-        faiss_index_path: Optional[Path] = None,
+        chroma_persist_dir: Optional[Path] = None,
         bm25_index_path: Optional[Path] = None,
         **kwargs,
     ) -> "HybridRetriever":
@@ -140,10 +140,10 @@ class HybridRetriever:
         从磁盘加载 FAISS 和 BM25 索引，构建 HybridRetriever。
         """
         settings = get_settings()
-        faiss_path = faiss_index_path or settings.faiss_index_path
+        faiss_path = chroma_persist_dir or settings.chroma_persist_dir
         bm25_path = bm25_index_path or (faiss_path.parent / "bm25_index.pkl")
 
-        vs = build_vector_store(index_path=faiss_path)
+        vs = build_vector_store(persist_dir=faiss_path)
 
         bm25 = None
         if bm25_path.exists():

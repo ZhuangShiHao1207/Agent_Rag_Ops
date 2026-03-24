@@ -44,10 +44,10 @@ class Settings(BaseSettings):
         default="https://dashscope.aliyuncs.com/compatible-mode/v1", env="QWEN_API_BASE"
     )
 
-    # Vector index (FAISS for current phase)
-    faiss_index_path: Path = Field(
-        default=PROJECT_ROOT / "data" / "indexes" / "faiss_index",
-        env="FAISS_INDEX_PATH",
+    # Chroma persist dir
+    chroma_persist_dir: Path = Field(
+        default=PROJECT_ROOT / "data" / "indexes" / "chroma_db",
+        env="CHROMA_PERSIST_DIR",
     )
     top_k: int = Field(default=5, env="TOP_K")
 

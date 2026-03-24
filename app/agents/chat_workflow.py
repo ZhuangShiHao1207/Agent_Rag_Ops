@@ -1,13 +1,12 @@
 """
 对话 Agent —— LangGraph StateGraph 实现
 
-对应 Go 项目：internal/ai/agent/chat_pipeline/
 架构：
     START
       │
     rag_retrieve  ← 混合检索（BM25 + FAISS + cosine reranker）
       │
-    react_agent   ← ReAct Agent（工具：query_internal_docs, get_current_time）
+    react_agent   ← ReAct Agent（工具：query_internal_docs, get_current_time, query_pod_logs）
       │
      END
 
@@ -27,14 +26,16 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.state import ChatState
-from app.agents.tools import get_current_time, query_internal_docs
+from app.agents.tools import get_current_time, query_internal_docs, query_pod_logs
 from app.llm import build_langchain_llm
 from app.rag.hybrid_retriever import HybridRetriever
+
+from langchain_core.runnables import RunnableConfig
 
 # --------------------------------------------------------------------------
 # 工具注册
 # --------------------------------------------------------------------------
-TOOLS = [query_internal_docs, get_current_time]
+TOOLS = [query_internal_docs, get_current_time, query_pod_logs]
 
 # 工具名 -> callable 映射，用于执行工具调用
 TOOL_MAP = {t.name: t for t in TOOLS}
@@ -43,7 +44,7 @@ TOOL_MAP = {t.name: t for t in TOOLS}
 # 节点：RAG 检索
 # --------------------------------------------------------------------------
 
-def rag_retrieve_node(state: ChatState) -> Dict[str, Any]:
+def rag_retrieve_node(state: ChatState, config: RunnableConfig) -> Dict[str, Any]:
     """
     从 messages 中提取最新用户问题，进行混合检索。
     检索结果存入 state['rag_docs']，供后续节点注入 prompt。
@@ -74,7 +75,7 @@ def rag_retrieve_node(state: ChatState) -> Dict[str, Any]:
 # 节点：ReAct Agent（支持工具调用循环）
 # --------------------------------------------------------------------------
 
-def react_agent_node(state: ChatState) -> Dict[str, Any]:
+def react_agent_node(state: ChatState, config: RunnableConfig) -> Dict[str, Any]:
     """
     ReAct Agent 节点：
     1. 将 RAG 文档拼接到 system prompt
@@ -99,7 +100,23 @@ def react_agent_node(state: ChatState) -> Dict[str, Any]:
     system_content = (
         "你是一位专业的 AIOps 运维专家，拥有丰富的云原生系统排查经验。\n"
         "在回答问题时，请结合提供的运维知识库文档进行分析，给出清晰、准确的回答。\n"
-        "如需查询最新信息或执行特定操作，可使用提供的工具。\n"
+        "记住要善于利用工具，如果你需要查询内部文档、获取当前时间或查询日志，请调用相应的工具。\n"
+        "- 查询内部文档：调用 query_internal_docs，参数为你的查询内容\n"
+        "- 获取当前时间：调用 get_current_time，无需参数\n"
+        "- 查询日志：调用 query_pod_logs，参数为 pod 名称和查询关键词\n\n"
+        "以下是一些示例对话，展示了如何使用工具：\n"
+        "用户1：请帮我查询内部文档，关键词是“故障排查”。\n"
+        "Agent1：调用 query_internal_docs，参数为“故障排查”。\n"
+        "工具返回1：这是关于故障排查的文档内容。\n"
+        "Agent1：根据查询到的文档内容，以下是故障排查的步骤：...\n\n"
+        "用户2：请告诉我当前时间。\n"
+        "Agent2：调用 get_current_time，无需参数。\n"
+        "工具返回2：当前时间是 2026-03-19 10:00。\n"
+        "Agent2：当前时间是 2026-03-19 10:00。\n\n"
+        "用户3：请查询 pod 'example-pod' 的日志，关键词是 'error'。\n"
+        "Agent3：调用 query_pod_logs，参数为 pod 名称 'example-pod' 和查询关键词 'error'。\n"
+        "工具返回3：以下是日志内容：...\n"
+        "Agent3：根据日志内容，发现了以下问题：..."
     )
     if rag_context:
         system_content += f"\n\n【运维知识库参考文档】\n{rag_context}"
@@ -112,8 +129,9 @@ def react_agent_node(state: ChatState) -> Dict[str, Any]:
     final_answer = ""
 
     for _ in range(5):
-        # invoke 经过 LangChain 事件系统 → astream_events 可捕获 on_chat_model_stream
-        response: AIMessage = llm_with_tools.invoke(lc_messages)
+        # invoke 经过 LangChain 事件系统 → astream_events 可捕获 on_chat_model_stream，
+        # 并通过传入 config 将 LangFuse Callback 贯穿下去
+        response: AIMessage = llm_with_tools.invoke(lc_messages, config=config)
         lc_messages.append(response)
         new_messages.append(response)
 
@@ -127,7 +145,7 @@ def react_agent_node(state: ChatState) -> Dict[str, Any]:
             tool_fn = TOOL_MAP.get(tc["name"])
             if tool_fn:
                 try:
-                    tool_result = str(tool_fn.invoke(tc["args"]))
+                    tool_result = str(tool_fn.invoke(tc["args"], config=config))
                 except Exception as e:
                     tool_result = f"工具执行错误: {e}"
             else:

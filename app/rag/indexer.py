@@ -52,7 +52,8 @@ def _split_docs(docs: List[Document]) -> List[Document]:
 
 def rebuild_index() -> dict:
     """
-    从 data/ 目录重新构建 FAISS 向量索引 + BM25 倒排索引。
+    从 data/ 目录重新构建全量拉取 Chroma 向量索引 + BM25 倒排索引。
+    Chroma 自带幂等性保护，未被修改的文件即使重复插入也不会重复产生 Embedding Token 花销。
 
     返回简单的统计信息，便于 /knowledge/index 接口展示。
     """
@@ -65,27 +66,59 @@ def rebuild_index() -> dict:
     if not chunks:
         return {
             "data_root": str(data_root),
-            "faiss_index_path": str(settings.faiss_index_path),
+            "chroma_persist_dir": str(settings.chroma_persist_dir),
             "file_count": len(docs),
             "chunk_count": 0,
             "warning": "No chunks generated. Check data/ directory.",
         }
 
-    # 1. 构建 FAISS 向量索引
+    # 1. 插入或覆盖 Chroma 向量索引
     vs = build_vector_store()
     vs.add_documents(chunks)
-    vs.save()
+    # Chroma 自动持久化，无需 vs.save()
 
-    # 2. 同步构建 BM25 倒排索引（持久化到与 FAISS 相同的父目录）
-    bm25_path = settings.faiss_index_path.parent / "bm25_index.pkl"
+    # 2. 同步构建 BM25 倒排索引（持久化到与 Chroma 相同的父目录）
+    bm25_path = settings.chroma_persist_dir.parent / "bm25_index.pkl"
     bm25 = BM25Retriever.build(chunks, save_path=bm25_path)  # noqa: F841
 
     return {
         "data_root": str(data_root),
-        "faiss_index_path": str(settings.faiss_index_path),
+        "chroma_persist_dir": str(settings.chroma_persist_dir),
         "bm25_index_path": str(bm25_path),
         "file_count": len(docs),
         "chunk_count": len(chunks),
+    }
+
+def increment_index(files: List[Path]) -> dict:
+    """增量只解析有更新的/新上传的文件，节省时间，同时重全量建内存 BM25 以保持同步"""
+    settings = get_settings()
+    from langchain_community.document_loaders import TextLoader
+    
+    new_docs = []
+    for file_path in files:
+        loader = TextLoader(str(file_path), encoding="utf-8")
+        new_docs.extend(loader.load())
+
+    new_chunks = _split_docs(new_docs)
+
+    if new_chunks:
+        # Chroma 增量插入
+        vs = build_vector_store()
+        vs.add_documents(new_chunks)
+
+    # BM25 需要全局重新构建才能索引新增字词频率，但因为不消耗 API 只是本地执行，成本极低
+    data_root = Path(__file__).resolve().parent.parent.parent / "data"
+    all_local_docs = _load_markdown_docs(data_root)
+    all_chunks = _split_docs(all_local_docs)
+
+    bm25_path = settings.chroma_persist_dir.parent / "bm25_index.pkl"
+    if all_chunks:
+        BM25Retriever.build(all_chunks, save_path=bm25_path)
+
+    return {
+        "incremental_chunks": len(new_chunks),
+        "total_bm25_chunks": len(all_chunks) if all_chunks else 0,
+        "bm25_index_path": str(bm25_path),
     }
 
 

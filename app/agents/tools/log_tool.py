@@ -9,9 +9,23 @@ Python 版：
   - 后续通过 mcp-sdk 接入真实日志服务，保持接口签名不变。
 """
 import os
+import asyncio
+from pathlib import Path
+from dotenv import load_dotenv
 from langchain_core.tools import tool
 
+# 确保在模块加载时读取 .env 文件
+_env_path = Path(__file__).resolve().parent.parent.parent.parent / ".env"
+load_dotenv(_env_path)
+
+try:
+    from mcp import ClientSession
+    from mcp.client.sse import sse_client
+except ImportError:
+    pass
+
 MCP_LOG_SERVER_URL = os.getenv("MCP_LOG_SERVER_URL", "")
+print(f"DEBUG: Current MCP_LOG_SERVER_URL is: '{MCP_LOG_SERVER_URL}'")
 
 # Mock 日志数据（按服务名映射）
 _MOCK_LOGS: dict[str, str] = {
@@ -45,19 +59,40 @@ _MOCK_LOGS: dict[str, str] = {
 }
 
 
-def _fetch_logs_via_mcp(service: str, minutes: int) -> str:
-    """通过 MCP 协议查询日志（实际接入时替换此函数体）。"""
+async def _do_mcp_query(service: str, minutes: int) -> str:
+    """内部异步函数：实际执行 MCP 工具调用。"""
     try:
-        import requests
-        resp = requests.post(
-            f"{MCP_LOG_SERVER_URL}/tools/query_log",
-            json={"service": service, "minutes": minutes},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json().get("content", "")
+        # MCP SSE Client URL，如有需要可拼接具体路径，如 MCP_LOG_SERVER_URL + "/sse"
+        sse_url = MCP_LOG_SERVER_URL
+        
+        async with sse_client(sse_url) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream) as session:
+                await session.initialize()
+
+                # --- 调试：看看 Server 到底提供了哪些工具 ---
+                available_tools = await session.list_tools()
+                print(f"DEBUG: Available tools: {[t.name for t in available_tools.tools]}")
+                # ------------------------------------------
+
+                # 假定目标 MCP server 支持的对应 tool 名称为 "query_log"？
+                # 这里名称和参数目前暂时未确定
+                result = await session.call_tool("query_log", {
+                    "service": service,
+                    "minutes": minutes
+                })
+                
+                # result.content 是一个包含了各分类 content (text / image) 的 list
+                if not result.content:
+                    return "MCP 日志查询返回为空。"
+                
+                texts = [c.text for c in result.content if getattr(c, "type", "") == "text"]
+                return "\n".join(texts)
     except Exception as e:
         return f"MCP 日志查询失败: {e}"
+
+def _fetch_logs_via_mcp(service: str, minutes: int) -> str:
+    """通过 MCP 协议查询日志（使用 mcp python sdk 同步包装）。"""
+    return asyncio.run(_do_mcp_query(service, minutes))
 
 
 @tool

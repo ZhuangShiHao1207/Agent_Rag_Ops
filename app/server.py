@@ -103,7 +103,7 @@ async def knowledge_index(
     settings: Settings = Depends(get_app_settings),
 ) -> JSONResponse:
     """
-    构建/重建知识库索引（FAISS 向量索引 + BM25 倒排索引）。
+    构建/重建知识库索引（Chroma 向量索引 + BM25 倒排索引）。
     从 data/ 目录加载所有 Markdown 文档并切分写入。
     """
     # 清除 Settings 缓存，确保重建时读取最新的 .env 配置
@@ -126,13 +126,13 @@ async def knowledge_upload(
     """
     上传知识库文档到 data/ 目录。
     支持文件类型：.md / .txt（PDF 需额外安装解析库）。
-    上传后需再次调用 /knowledge/index 来重建索引。
+    上传后调用 increment_index 将文档增量更新入向量库并重建本地 BM25。
     """
     settings = get_settings()
-    # data_root 与 indexer.py 中保持一致：项目根下的 data/
-    data_root = settings.faiss_index_path.parent.parent  # indexes/ -> data/
+    data_root = settings.chroma_persist_dir.parent.parent  # indexes/ -> data/
 
     saved: List[str] = []
+    saved_paths: List[Path] = []
     skipped: List[str] = []
 
     for upload in files:
@@ -153,18 +153,30 @@ async def knowledge_upload(
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(content)
         saved.append(filename)
+        saved_paths.append(dest)
 
     if not saved and skipped:
         raise HTTPException(
             status_code=400,
             detail={"message": "所有文件均被跳过", "skipped": skipped},
         )
+        
+    # 触发增量构建
+    from app.rag.indexer import increment_index
+    try:
+        stats = increment_index(saved_paths)
+    except Exception as e:
+         raise HTTPException(
+            status_code=500,
+            detail={"message": "文件已保存，但索引增量更新失败", "error": str(e)},
+        )
 
     return JSONResponse({
-        "message": f"上传完成，共 {len(saved)} 个文件。请调用 /knowledge/index 重建索引。",
+        "message": f"上传并增量建库完成，共 {len(saved)} 个文件。",
         "saved": saved,
         "skipped": skipped,
         "data_dir": str(data_root),
+        "index_stats": stats
     })
 
 
@@ -176,20 +188,28 @@ async def knowledge_inspect(limit: int = 20) -> JSONResponse:
     """
     vs = build_vector_store()
     vs._ensure_loaded()
-    if vs._faiss is None:
+    if vs._chroma is None:
         return JSONResponse({"total": 0, "chunks": [], "message": "索引尚未建立，请先调用 /knowledge/index"})
 
-    docstore: dict = vs._faiss.docstore._dict
-    total = len(docstore)
-    chunks = [
-        {
-            "id": k,
-            "content": v.page_content[:400],
-            "metadata": v.metadata,
-        }
-        for k, v in list(docstore.items())[:limit]
-    ]
-    return JSONResponse({"total": total, "limit": limit, "chunks": chunks})
+    try:
+        # Chroma 的 get 可以全量抓取指定数量
+        collection_data = vs._chroma.get(limit=limit)
+        docs = collection_data.get("documents", [])
+        metadatas = collection_data.get("metadatas", [])
+        ids = collection_data.get("ids", [])
+        total = vs._chroma._collection.count()
+        
+        chunks = [
+            {
+                "id": ids[i],
+                "content": docs[i][:400] if docs and docs[i] else "",
+                "metadata": metadatas[i] if metadatas and metadatas[i] else {},
+            }
+            for i in range(len(ids))
+        ]
+        return JSONResponse({"total": total, "limit": limit, "chunks": chunks})
+    except Exception as e:
+        return JSONResponse({"total": 0, "chunks": [], "error": str(e)})
 
 
 @app.get("/knowledge/search")

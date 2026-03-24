@@ -46,7 +46,9 @@ from langgraph.graph import END, START, StateGraph
 from app.agents.state import Alert, OpsState
 from app.agents.tools.log_tool import query_pod_logs
 from app.agents.tools.prometheus import query_metrics, query_prometheus_alerts
-from app.llm import build_llm_client
+from langchain_core.runnables import RunnableConfig
+from app.llm import build_llm_client, build_langchain_llm
+from langchain_core.messages import SystemMessage, HumanMessage
 
 MAX_ITERATIONS = 2
 
@@ -61,20 +63,24 @@ HIGH_RISK_KEYWORDS = [
 # 内部帮助函数
 # --------------------------------------------------------------------------
 
-def _llm_call(system: str, user: str) -> str:
-    """同步调用 LLM。"""
-    client = build_llm_client()
-    return client.chat([
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ])
+def _llm_call(system: str, user: str, config: RunnableConfig | None = None) -> str:
+    """同步调用 LLM，通过 LangChain 支持 LangFuse 回调链"""
+    llm = build_langchain_llm()
+    messages = [
+        SystemMessage(content=system),
+        HumanMessage(content=user)
+    ]
+    # 将 LangChain config 贯穿传递，触发回调观测
+    # 也可以传 kwargs，但此处封装已足够
+    result = llm.invoke(messages, config=config)
+    return str(result.content)
 
 
 # --------------------------------------------------------------------------
 # 节点 1：Router Agent —— 解析告警，决定分析方向
 # --------------------------------------------------------------------------
 
-def router_agent_node(state: OpsState) -> Dict[str, Any]:
+def router_agent_node(state: OpsState, config: RunnableConfig) -> Dict[str, Any]:
     """
     对应 Go：Planner 的第 1 步，解析告警并决定要调用哪些工具。
     输出：alerts 列表 + next_action 路由决策。
@@ -82,7 +88,7 @@ def router_agent_node(state: OpsState) -> Dict[str, Any]:
     alert_input = state.get("alert_input", "")
 
     # 获取 Prometheus 当前告警
-    raw_alerts = query_prometheus_alerts.invoke({})
+    raw_alerts = query_prometheus_alerts.invoke({}, config=config)
 
     system = (
         "你是运维告警路由专家。根据告警信息，判断需要进行哪些分析："
@@ -92,7 +98,7 @@ def router_agent_node(state: OpsState) -> Dict[str, Any]:
     user = f"用户描述：{alert_input}\n\nPrometheus 告警：\n{raw_alerts}"
 
     try:
-        resp = _llm_call(system, user)
+        resp = _llm_call(system, user, config=config)
         # 提取 JSON
         start = resp.find("{")
         end = resp.rfind("}") + 1
@@ -127,7 +133,7 @@ def router_agent_node(state: OpsState) -> Dict[str, Any]:
 # 节点 2a：Log Analyst Agent
 # --------------------------------------------------------------------------
 
-def log_analyst_node(state: OpsState) -> Dict[str, Any]:
+def log_analyst_node(state: OpsState, config: RunnableConfig) -> Dict[str, Any]:
     """
     对应 Go：Executor 调用 query_log.go（MCP）工具。
     查询相关服务的错误日志并提炼摘要。
@@ -144,7 +150,7 @@ def log_analyst_node(state: OpsState) -> Dict[str, Any]:
 
     log_parts = []
     for svc in services[:3]:  # 最多查 3 个服务
-        raw = query_pod_logs.invoke({"service": svc, "minutes": 10})
+        raw = query_pod_logs.invoke({"service": svc, "minutes": 10}, config=config)
         log_parts.append(f"=== {svc} ===\n{raw}")
 
     all_logs = "\n\n".join(log_parts)
@@ -155,6 +161,7 @@ def log_analyst_node(state: OpsState) -> Dict[str, Any]:
             "重点关注 ERROR/WARN 级别，识别根因线索（OOM、连接失败、超时等），输出 200 字以内的分析摘要。"
         ),
         user=all_logs,
+        config=config,
     )
     return {"log_summary": summary}
 
@@ -163,7 +170,7 @@ def log_analyst_node(state: OpsState) -> Dict[str, Any]:
 # 节点 2b：Metrics Agent
 # --------------------------------------------------------------------------
 
-def metrics_agent_node(state: OpsState) -> Dict[str, Any]:
+def metrics_agent_node(state: OpsState, config: RunnableConfig) -> Dict[str, Any]:
     """
     对应 Go：Executor 调用 query_metrics_alerts.go 工具。
     查询 Prometheus 指标并提炼摘要。
@@ -179,8 +186,8 @@ def metrics_agent_node(state: OpsState) -> Dict[str, Any]:
         services = ["api-server"]
 
     # 查询关键指标
-    cpu_data = query_metrics.invoke({"promql": f'rate(process_cpu_seconds_total[5m])'})
-    alert_data = query_prometheus_alerts.invoke({})
+    cpu_data = query_metrics.invoke({"promql": f'rate(process_cpu_seconds_total[5m])'}, config=config)
+    alert_data = query_prometheus_alerts.invoke({}, config=config)
 
     raw = f"CPU 指标：\n{cpu_data}\n\n活跃告警：\n{alert_data}"
 
@@ -190,6 +197,7 @@ def metrics_agent_node(state: OpsState) -> Dict[str, Any]:
             "重点识别资源瓶颈（CPU/内存/连接数），输出 200 字以内的指标摘要。"
         ),
         user=raw,
+        config=config,
     )
     return {"metrics_summary": summary}
 
@@ -198,7 +206,7 @@ def metrics_agent_node(state: OpsState) -> Dict[str, Any]:
 # 节点 2c：RAG Recall Agent
 # --------------------------------------------------------------------------
 
-def rag_recall_node(state: OpsState) -> Dict[str, Any]:
+def rag_recall_node(state: OpsState, config: RunnableConfig) -> Dict[str, Any]:
     """
     对应 Go：Executor 调用 query_internal_docs.go 工具。
     从知识库检索与当前告警相关的运维手册文档。
@@ -230,7 +238,7 @@ def rag_recall_node(state: OpsState) -> Dict[str, Any]:
 # 节点 3：Diagnosis Agent —— 根因分析 RCA
 # --------------------------------------------------------------------------
 
-def diagnosis_agent_node(state: OpsState) -> Dict[str, Any]:
+def diagnosis_agent_node(state: OpsState, config: RunnableConfig) -> Dict[str, Any]:
     """
     对应 Go：Planner（使用 DeepSeek-R1 推理，Python 版用 hunyuan-turbo 或可配置）。
     综合日志、指标、知识库输出根因分析报告。
@@ -242,12 +250,16 @@ def diagnosis_agent_node(state: OpsState) -> Dict[str, Any]:
 
     system = (
         "你是资深 SRE 运维专家，擅长云原生系统根因分析。\n"
-        "请综合以下信息，给出结构化的根因分析报告（RCA Report）：\n"
+        "请务必结合提供的日志、指标和知识库信息进行分析，输出清晰、专业的报告，切忌泛泛而谈\n"
+        "你的任务就是综合信息，给出严谨的、结构化的根因分析报告（RCA Report）：\n"
         "1. 故障概述（1-2句）\n"
         "2. 根因分析（列举 1-3 个可能根因，附置信度）\n"
         "3. 影响范围\n"
         "4. 建议处置步骤（按优先级排序）\n"
-        "5. 预防措施"
+        "5. 预防措施 \n\n"
+        "记住，只有当你确信根因时才给出结论，否则请说明信息不足并建议补充。并建议需要补充哪些信息。\n"
+        "例如："
+        "信息不足，无法确定根因。建议补充：1) 相关服务的更多日志；2) 过去 1 小时的指标数据；3) 相关知识库文档；4) 用户的更详细解释"
     )
     user = (
         f"【原始告警】\n{state.get('alert_input', '')}\n\n"
@@ -256,7 +268,7 @@ def diagnosis_agent_node(state: OpsState) -> Dict[str, Any]:
         f"【知识库参考】\n{rag_context}"
     )
 
-    report = _llm_call(system=system, user=user)
+    report = _llm_call(system=system, user=user, config=config)
 
     # 判断是否需要 replan（信息不足时）
     iteration = state.get("iteration", 0)
@@ -340,7 +352,7 @@ def report_node(state: OpsState) -> Dict[str, Any]:
 # 节点 6b：Replan Node —— 补充信息后重新路由
 # --------------------------------------------------------------------------
 
-def replan_node(state: OpsState) -> Dict[str, Any]:
+def replan_node(state: OpsState, config: RunnableConfig) -> Dict[str, Any]:
     """
     对应 Go：Replanner。
     当 Diagnosis Agent 判断信息不足时，扩大查询范围重新分析。
@@ -353,7 +365,7 @@ def replan_node(state: OpsState) -> Dict[str, Any]:
     user = f"当前报告（信息不足部分）：\n{current_report}"
 
     try:
-        resp = _llm_call(system, user)
+        resp = _llm_call(system, user, config=config)
         start = resp.find("{")
         end = resp.rfind("}") + 1
         parsed = json.loads(resp[start:end]) if start != -1 else {}

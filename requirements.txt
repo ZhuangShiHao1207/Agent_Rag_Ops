@@ -9,13 +9,15 @@ langchain==0.3.7
 langchain-community==0.3.5
 langchain-openai==0.2.14
 langgraph==0.2.45
-faiss-cpu==1.8.0.post1
+chromadb==0.5.23
+posthog<3,>=2.4.0
 rank-bm25==0.2.2
 
-openai==1.54.3
+openai>=1.58.1,<2.0.0
 langfuse==2.52.0
 numpy>=1.26.0
 python-multipart
+mcp
 
 # 根据需要接入混元 API，可在代码中通过 httpx/requests 调用，不强制绑定 SDK
 # 后续 BGE Reranker 支持（Phase 3 之后）：
